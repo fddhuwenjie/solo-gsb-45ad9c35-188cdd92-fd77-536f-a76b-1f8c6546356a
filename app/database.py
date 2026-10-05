@@ -147,7 +147,7 @@ def list_clauses(
 def list_edges(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     # 关联登记版本，取其生效时间：无接续的纯废止以该时刻为废止时刻
     return conn.execute(
-        "SELECT e.kind, e.predecessor_doc, e.predecessor_version,"
+        "SELECT e.id, e.kind, e.predecessor_doc, e.predecessor_version,"
         " e.predecessor_clause, e.successor_doc, e.successor_version,"
         " e.successor_clause, e.note, e.recorded_by_doc, e.recorded_by_version,"
         " dv.effective_at AS recorded_effective_at"
@@ -155,6 +155,16 @@ def list_edges(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         " LEFT JOIN document_versions dv"
         "   ON dv.doc_id = e.recorded_by_doc"
         "  AND dv.version = e.recorded_by_version"
+    ).fetchall()
+
+
+def list_document_versions(
+    conn: sqlite3.Connection,
+) -> list[sqlite3.Row]:
+    """全部已登记文档版本（基线快照的一部分）。"""
+    return conn.execute(
+        "SELECT doc_id, version, name, effective_at, created_at"
+        " FROM document_versions"
     ).fetchall()
 
 
@@ -406,3 +416,95 @@ def fetch_document(
         "revisions": [dict(r) for r in edges],
         "citations": [dict(r) for r in cites],
     }
+
+
+# --------------------------------------------------------------------------- #
+# 预演叠加层：把基线快照复制进独立的内存库，再走正式写入路径叠加草案
+# --------------------------------------------------------------------------- #
+# 各表参与基线复制的列（须与 SCHEMA 中的定义一致；显式列出以保留
+# AUTOINCREMENT 主键原值，保证预演前后引用 ID 与库中一致）。
+_DOCUMENT_VERSION_COLS = (
+    "doc_id", "version", "name", "effective_at", "created_at",
+)
+_CLAUSE_COLS = (
+    "doc_id", "version", "clause_id", "title", "text",
+    "effective_at", "expires_at",
+)
+_EDGE_COLS = (
+    "id", "kind",
+    "predecessor_doc", "predecessor_version", "predecessor_clause",
+    "successor_doc", "successor_version", "successor_clause",
+    "recorded_by_doc", "recorded_by_version", "note",
+)
+_CITATION_COLS = (
+    "id", "source_doc", "source_version", "source_clause",
+    "target_doc", "target_clause", "target_version", "context",
+)
+
+
+def _bulk_copy(
+    overlay: sqlite3.Connection,
+    table: str,
+    columns: tuple[str, ...],
+    rows: Iterable[sqlite3.Row],
+) -> None:
+    rows = list(rows)
+    if not rows:
+        return
+    placeholders = ",".join("?" for _ in columns)
+    col_list = ",".join(columns)
+    overlay.executemany(
+        f"INSERT INTO {table} ({col_list}) VALUES ({placeholders})",
+        [tuple(r[c] for c in columns) for r in rows],
+    )
+
+
+def build_overlay(
+    document_rows: Iterable[sqlite3.Row],
+    clause_rows: Iterable[sqlite3.Row],
+    edge_rows: Iterable[sqlite3.Row],
+    citation_rows: Iterable[sqlite3.Row],
+) -> sqlite3.Connection:
+    """以基线快照构造一个独立内存库。
+
+    预演在该叠加层上复用 :func:`insert_corpus` 的正式写入/校验路径，
+    从而既不触碰共享库（草案绝不落库、外部连接已提交数据不受影响），
+    又与正式登记得到完全一致的计数、告警与 422 校验结果。
+    行主键（引用 ID 等）按原值复制，保证审查结果与库中 ID 一致。
+    调用方负责关闭返回的连接。
+    """
+    overlay = sqlite3.connect(":memory:")
+    overlay.row_factory = sqlite3.Row
+    # SCHEMA 首条是 PRAGMA journal_mode=WAL；内存库会静默忽略该设置，
+    # 其余建表语句照常执行。
+    overlay.executescript(SCHEMA)
+    overlay.execute("PRAGMA foreign_keys = ON")
+
+    document_rows = list(document_rows)
+    clause_rows = list(clause_rows)
+    edge_rows = list(edge_rows)
+    citation_rows = list(citation_rows)
+
+    _bulk_copy(
+        overlay, "document_versions", _DOCUMENT_VERSION_COLS, document_rows
+    )
+    _bulk_copy(overlay, "clause_versions", _CLAUSE_COLS, clause_rows)
+    _bulk_copy(overlay, "revision_edges", _EDGE_COLS, edge_rows)
+    _bulk_copy(overlay, "citations", _CITATION_COLS, citation_rows)
+
+    # 同步 AUTOINCREMENT 序列：草案新增行的内部 ID 紧随基线，
+    # 避免任何依赖自增值的行为与正式登记产生偏差。
+    max_edge = max((r["id"] for r in edge_rows), default=0)
+    max_cite = max((r["id"] for r in citation_rows), default=0)
+    overlay.execute(
+        "INSERT OR REPLACE INTO sqlite_sequence (name, seq)"
+        " VALUES ('revision_edges', ?)",
+        (max_edge,),
+    )
+    overlay.execute(
+        "INSERT OR REPLACE INTO sqlite_sequence (name, seq)"
+        " VALUES ('citations', ?)",
+        (max_cite,),
+    )
+    overlay.commit()
+    return overlay

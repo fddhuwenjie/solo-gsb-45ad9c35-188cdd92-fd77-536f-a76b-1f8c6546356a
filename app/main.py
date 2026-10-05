@@ -179,45 +179,63 @@ def rehearse(
     target = request.target_at or datetime.now(timezone.utc)
 
     with _db_lock:
-        # 重复版本沿用 /corpus 的 409 错误响应（此时尚未开启写事务）
-        existing = db.document_version_exists(conn, payload.doc_id, payload.version)
-        if existing is not None:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"文档版本 {payload.doc_id}@{payload.version} 已写入，"
-                    "相同文档版本不得重复写入；如需修订请使用新的版本号"
-                ),
-            )
-
-        # 预演前的库状态快照：存量引用（拟登记版本自带引用稍后才出现，
-        # 自然不纳入比较），以及前后审查共用的条款/关系基线。
-        before_citations = db.list_citations(
-            conn,
-            source_doc=request.source_doc,
-            source_version=request.source_version,
-            source_clause=request.source_clause,
-            target_doc=request.target_doc,
-        )
-        base_clauses = db.list_clauses(conn)
-        base_edges = db.list_edges(conn)
-
-        # 假定登记：复用 /corpus 的同一写入与校验路径（含非法关系的 422），
-        # 但绝不 commit；finally 中一律 rollback，预演成功或失败都不留痕。
+        # 基线在同一条只读事务（WAL 快照）内取齐：版本占用、存量引用、
+        # 条款、文档版本与修订关系共享同一库状态。即使预演读基线期间
+        # 另一连接登记了新修订，该修订也不会混入任一侧；基线在首个读
+        # 语句处固定，此前已提交的数据则在两侧都可见。
+        conn.execute("BEGIN")
         try:
-            result = db.insert_corpus(conn, payload)
-            after_clauses = db.list_clauses(conn)
-            after_edges = db.list_edges(conn)
+            # 重复版本沿用 /corpus 的 409 错误响应（判定同样基于基线快照）
+            existing = db.document_version_exists(
+                conn, payload.doc_id, payload.version
+            )
+            if existing is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"文档版本 {payload.doc_id}@{payload.version} 已写入，"
+                        "相同文档版本不得重复写入；如需修订请使用新的版本号"
+                    ),
+                )
 
-            before_audit = _audit_from_snapshots(
-                base_clauses, base_edges, before_citations, target
+            # 预演前的库状态快照：存量引用（拟登记版本自带引用稍后才出现，
+            # 自然不纳入比较），以及前后审查共用的条款/关系基线。
+            before_citations = db.list_citations(
+                conn,
+                source_doc=request.source_doc,
+                source_version=request.source_version,
+                source_clause=request.source_clause,
+                target_doc=request.target_doc,
             )
-            # 前后审查基于同一份库状态：引用集合固定为登记前的存量引用
-            after_audit = _audit_from_snapshots(
-                after_clauses, after_edges, before_citations, target
-            )
+            base_documents = db.list_document_versions(conn)
+            base_clauses = db.list_clauses(conn)
+            base_edges = db.list_edges(conn)
         finally:
+            # 共享连接上只读不写；回滚仅用于结束快照事务、释放读状态，
+            # 绝不会影响其他连接已提交的数据。
             conn.rollback()
+
+    # “假定登记”发生在独立的内存叠加层上：与 /corpus 走同一写入与校验
+    # 路径（含非法关系 422、计数与悬空告警），但草案自始至终不触碰
+    # 共享库，预演成功或失败都不留痕，也不会回滚外部连接的已提交数据。
+    overlay = db.build_overlay(
+        base_documents, base_clauses, base_edges, before_citations
+    )
+    try:
+        result = db.insert_corpus(overlay, payload)
+        after_clauses = db.list_clauses(overlay)
+        after_edges = db.list_edges(overlay)
+
+        before_audit = _audit_from_snapshots(
+            base_clauses, base_edges, before_citations, target
+        )
+        # 前后审查基于同一份库状态：引用集合固定为登记前的存量引用，
+        # 仅条款与修订关系叠加拟登记版本。
+        after_audit = _audit_from_snapshots(
+            after_clauses, after_edges, before_citations, target
+        )
+    finally:
+        overlay.close()
 
     changes = _diff_audits(before_audit["results"], after_audit["results"])
     return {

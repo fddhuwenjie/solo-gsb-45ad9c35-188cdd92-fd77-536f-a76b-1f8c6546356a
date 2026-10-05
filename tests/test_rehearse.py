@@ -7,10 +7,16 @@
 * 预演成功或失败均不留任何文档/条款/关系/引用，之后仍可正式登记；
 * 重复版本 409、非法关系 422，沿用 /corpus 错误响应；
 * 拟登记版本自带引用不纳入比较；
-* 结果按原引用 ID 升序；过滤参数生效。
+* 结果按原引用 ID 升序；过滤参数生效；
+* 并发登记：基线在同一只读快照内取齐，外部连接在基线固定前后提交的
+  修订分别按“两侧均包含 / 两侧均不包含”处理，且外部数据不被回滚。
 """
 
+import sqlite3
+
 from fastapi.testclient import TestClient  # noqa: F401  (fixture 间接使用)
+
+from app import database as db
 
 
 # --------------------------------------------------------------------------- #
@@ -415,3 +421,217 @@ def test_rehearse_repeats_are_idempotent_and_isolated(client):
         body = r.json()
         assert body["total"] == 1
         assert body["changed"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# 并发登记：另一 SQLite 连接在预演基线确定前后穿插提交
+# --------------------------------------------------------------------------- #
+def _external_commit(payload):
+    """用独立连接（模拟另一个容器/进程）正式登记一份版本并提交。"""
+    ext = sqlite3.connect(db.get_db_path())
+    try:
+        ext.execute("PRAGMA journal_mode = WAL")
+        ext.execute("PRAGMA foreign_keys = ON")
+        with ext:
+            db.insert_corpus(ext, db.CorpusIn.model_validate(payload))
+    finally:
+        ext.close()
+
+
+def test_rehearse_external_commit_after_baseline_excluded_from_both_sides(
+        client, monkeypatch):
+    """基线读取完成后另一连接提交的修订，不得混入 before/after 任一侧。
+
+    在基线最后一次读取（list_edges）返回后、草案叠加之前，通过另一连接
+    提交民法典 2021（含一条自带引用）。预演自身叠加的草案是一个无关文档，
+    因此若基线未固定：外部修订会把存量引用从 repealed 变成 effective，
+    该变化被错误归到无关草案上（changed 虚增），外部自带引用也可能串入。
+    """
+    _post_corpus(client, _contract_law_1999(expires_at="2021-01-01T00:00:00Z"))
+    _post_corpus(client, _citation_doc(
+        "JUDICIAL-DOC", "2022", "ART-1", "CONTRACT-LAW", "ART-10"))
+
+    external = _civil_code_2021()
+    external["citations"] = [{
+        "source_clause": "ART-502",
+        "target_doc": "CONTRACT-LAW",
+        "target_clause": "ART-10",
+    }]
+    fired = {"done": False}
+    real_list_edges = db.list_edges
+
+    def spying_list_edges(conn, *args, **kwargs):
+        rows = real_list_edges(conn, *args, **kwargs)
+        # 仅在服务共享连接的基线读取完成后触发（叠加层与外部连接不触发）
+        if not fired["done"] and conn is client.app.state.conn:
+            fired["done"] = True
+            _external_commit(external)
+        return rows
+
+    monkeypatch.setattr(db, "list_edges", spying_list_edges)
+
+    unrelated = {
+        "doc_id": "UNRELATED",
+        "version": "2030",
+        "effective_at": "2030-01-01T00:00:00Z",
+        "clauses": [{
+            "clause_id": "ART-1",
+            "effective_at": "2030-01-01T00:00:00Z",
+        }],
+    }
+    r = client.post("/rehearse", json={
+        "candidate": unrelated,
+        "target_at": "2022-06-01T00:00:00Z",
+    })
+    assert fired["done"], "测试钩子未触发，未模拟到穿插提交"
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    # 外部修订在基线固定后提交：存量引用集合固定为原 1 条，
+    # 外部修订引起的结论变化不得归到无关草案
+    assert body["total"] == 1
+    assert body["changed"] == 0
+    assert body["changes"] == []
+    assert body["projected_counts"]["clauses"] == 1
+
+    # 草案不落库；外部连接已提交的数据也没有被回滚
+    assert client.get("/corpus/UNRELATED/2030").status_code == 404
+    assert client.get("/corpus/CIVIL-CODE/2021").status_code == 200
+    audit = client.post("/audit", json={
+        "target_at": "2022-06-01T00:00:00Z",
+    }).json()
+    statuses = {x["citation_id"]: x["status"] for x in audit["results"]}
+    assert statuses == {1: "effective", 2: "effective"}
+
+    # 随后仍能正常登记合法草案
+    r = client.post("/corpus", json=unrelated)
+    assert r.status_code == 201, r.text
+
+
+def test_rehearse_external_commit_before_baseline_present_on_both_sides(
+        client, monkeypatch):
+    """基线固定前已提交的外部修订，应同时出现在 before/after 两侧。"""
+    _post_corpus(client, _contract_law_1999(expires_at="2021-01-01T00:00:00Z"))
+    _post_corpus(client, _citation_doc(
+        "JUDICIAL-DOC", "2022", "ART-1", "CONTRACT-LAW", "ART-10"))
+
+    fired = {"done": False}
+    real_document_version_exists = db.document_version_exists
+
+    def spying_exists(conn, *args, **kwargs):
+        if not fired["done"] and conn is client.app.state.conn:
+            fired["done"] = True
+            # 在版本占用检查之前（基线内最早时刻）完成提交
+            _external_commit(_civil_code_2021())
+        return real_document_version_exists(conn, *args, **kwargs)
+
+    monkeypatch.setattr(db, "document_version_exists", spying_exists)
+
+    r = client.post("/rehearse", json={
+        "candidate": {
+            "doc_id": "UNRELATED",
+            "version": "2030",
+            "effective_at": "2030-01-01T00:00:00Z",
+            "clauses": [{
+                "clause_id": "ART-1",
+                "effective_at": "2030-01-01T00:00:00Z",
+            }],
+        },
+        "target_at": "2022-06-01T00:00:00Z",
+    })
+    assert fired["done"]
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    # 外部民法典已属于基线：存量引用两侧都解析到 CIVIL-CODE@2021，
+    # 草案与之无关，故无变化
+    assert body["total"] == 1
+    assert body["changed"] == 0
+    audit = client.post("/audit", json={
+        "target_at": "2022-06-01T00:00:00Z",
+    }).json()
+    assert audit["results"][0]["status"] == "effective"
+    assert audit["results"][0]["resolved"] == {
+        "doc_id": "CIVIL-CODE", "version": "2021", "clause_id": "ART-502",
+    }
+    assert client.get("/corpus/CIVIL-CODE/2021").status_code == 200
+
+
+def test_rehearse_422_under_interleaved_external_commit_leaves_both_intact(
+        client, monkeypatch):
+    """基线读取期间外部提交 + 草案非法关系 422：草案不落库，外部数据不回滚。"""
+    _post_corpus(client, _contract_law_1999())
+
+    fired = {"done": False}
+    real_list_edges = db.list_edges
+
+    def spying_list_edges(conn, *args, **kwargs):
+        rows = real_list_edges(conn, *args, **kwargs)
+        if not fired["done"] and conn is client.app.state.conn:
+            fired["done"] = True
+            _external_commit(_repeal_act_2020())
+        return rows
+
+    monkeypatch.setattr(db, "list_edges", spying_list_edges)
+
+    bad = _civil_code_2021()
+    bad["revisions"][0] = {
+        "kind": "revises",
+        "predecessor_doc": "CONTRACT-LAW",
+        "predecessor_version": "1999",
+        "predecessor_clause": "ART-10",
+    }
+    r = client.post("/rehearse", json={
+        "candidate": bad,
+        "target_at": "2022-06-01T00:00:00Z",
+    })
+    assert fired["done"]
+    assert r.status_code == 422
+
+    # 非法草案不留痕
+    assert client.get("/corpus/CIVIL-CODE/2021").status_code == 404
+    # 穿插期间由另一连接提交的废止令依然在库
+    assert client.get("/corpus/REPEAL-ACT/2020").status_code == 200
+
+    # 修正载荷后仍可正常登记
+    r = client.post("/corpus", json=_civil_code_2021())
+    assert r.status_code == 201, r.text
+
+
+def test_rehearse_409_is_judged_against_pinned_baseline(client, monkeypatch):
+    """基线固定后另一连接抢先登记同一版本：预演仍按基线快照正常给出。
+
+    快照语义下预演不感知基线之后的提交；预演不落库。随后直接登记时
+    由 /corpus 依据最新库状态返回 409（外部连接的数据同样保留）。
+    """
+    _post_corpus(client, _contract_law_1999(expires_at="2021-01-01T00:00:00Z"))
+    _post_corpus(client, _citation_doc(
+        "JUDICIAL-DOC", "2022", "ART-1", "CONTRACT-LAW", "ART-10"))
+
+    fired = {"done": False}
+    real_list_edges = db.list_edges
+
+    def spying_list_edges(conn, *args, **kwargs):
+        rows = real_list_edges(conn, *args, **kwargs)
+        if not fired["done"] and conn is client.app.state.conn:
+            fired["done"] = True
+            _external_commit(_civil_code_2021())
+        return rows
+
+    monkeypatch.setattr(db, "list_edges", spying_list_edges)
+
+    # 与外部提交完全相同的版本；快照在占用检查时尚不存在该版本
+    r = client.post("/rehearse", json={
+        "candidate": _civil_code_2021(),
+        "target_at": "2022-06-01T00:00:00Z",
+    })
+    assert fired["done"]
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["candidate"] == {"doc_id": "CIVIL-CODE", "version": "2021"}
+    assert body["changed"] == 1  # 草案效果只与固定基线比较，不与外部提交相消
+
+    # 外部提交保留；此时再以同一版本登记 → /corpus 返回 409
+    assert client.get("/corpus/CIVIL-CODE/2021").status_code == 200
+    r = client.post("/corpus", json=_civil_code_2021())
+    assert r.status_code == 409
